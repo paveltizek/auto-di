@@ -1,112 +1,158 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Fmasa\AutoDI\DI;
 
 use Fmasa\AutoDI\ClassList;
-use Nette\DI\Compiler;
 use Nette\DI\CompilerExtension;
+use Nette\DI\Config\Helpers as ConfigHelpers;
+use Nette\DI\Definitions\FactoryDefinition;
+use Nette\DI\Helpers as DIHelpers;
+use Nette\DI\ServiceDefinition;
 use Nette\Loaders\RobotLoader;
 
 class AutoDIExtension extends CompilerExtension
 {
 
-    private $defaults = [
-        'directories' => [
-            '%appDir%',
-        ],
-        'defaults' => [],
-    ];
+	private $defaults = [
+		'registerOnConfiguration' => FALSE,
+		'directories' => [
+			'%appDir%',
+		],
+		'defaults' => [],
+		'tempDir' => '%tempDir%',
+	];
 
-    public function beforeCompile()
-    {
-        $config = $this->getConfig($this->defaults);
+	public function beforeCompile(): void
+	{
+		if ( ! $this->shouldRegisterOnConfiguration()) {
+			$this->registerServices();
+		}
+	}
 
-        $robotLoader = new RobotLoader();
-        foreach($config['directories'] as $directory) {
-            $robotLoader->addDirectory($directory);
-        }
+	public function loadConfiguration(): void
+	{
+		if ($this->shouldRegisterOnConfiguration()) {
+			$this->registerServices();
+		}
+	}
 
-        $robotLoader->rebuild();
+	private function shouldRegisterOnConfiguration(): bool
+	{
+		$config = $this->defaults + $this->getConfig();
+		return (bool) $config['registerOnConfiguration'];
+	}
 
-        $classes = new ClassList(
-            array_keys($robotLoader->getIndexedClasses())
-        );
+	private function registerServices(): void
+	{
+		$builder = $this->getContainerBuilder();
+		$config = ConfigHelpers::merge($this->getConfig(), $this->defaults);
+		$config = DIHelpers::expand($config, $builder->parameters);
+		$robotLoader = new RobotLoader();
 
-        $builder = $this->getContainerBuilder();
+		foreach ($config['directories'] as $directory) {
+			$robotLoader->addDirectory($directory);
+		}
 
-        foreach($config['services'] as $service) {
+		$robotLoader->setTempDirectory($config['tempDir']);
+		$robotLoader->rebuild();
 
-            list($field, $matchingClasses) = $this->getClasses($service, $classes);
+		$classes = new ClassList(
+			array_keys($robotLoader->getIndexedClasses())
+		);
 
-            if(isset($service['exclude'])) {
-                $excluded = $service['exclude'];
-                $matchingClasses = $this->removeExcludedClasses($matchingClasses, is_string($excluded) ? [$excluded] : $excluded);
-                unset($service['exclude']);
-            }
 
-            $matchingClasses = array_filter($matchingClasses->toArray(), function ($class) use ($builder) {
-                return count($builder->findByType($class)) === 0;
-            });
+		foreach ($config['services'] as $service) {
 
-            $service += $config['defaults'];
+			[$field, $matchingClasses] = $this->getClasses($service, $classes);
 
-            $services = array_map(function ($class) use ($service, $field) {
-                $service[$field] = $class;
-                return $service;
-            }, $matchingClasses);
+			if (isset($service['exclude'])) {
+				$excluded = $service['exclude'];
+				$matchingClasses = $this->removeExcludedClasses($matchingClasses, is_string($excluded) ? [$excluded] : $excluded);
+				unset($service['exclude']);
+			}
 
-            Compiler::loadDefinitions(
-                $builder,
-                $services
-            );
-        }
-    }
+			$matchingClasses = array_filter($matchingClasses->toArray(), function ($class) use ($builder) {
+				return count($builder->findByType($class)) === 0;
+			});
 
-    /**
-     * @param array $service
-     * @param ClassList $classes
-     * @return array [definition field, Class list]
-     */
-    private function getClasses(array $service, ClassList $classes)
-    {
-        $types = [
-            'class' => $classes->getClasses(),
-            'implement' => $classes->getInterfaces(),
-        ];
+			$service += $config['defaults'];
 
-        if (count(array_intersect_key($service, $types)) !== 1) {
-            throw new \InvalidArgumentException(
-                'Exactly one of '
-                . implode(', ', array_keys($types))
-                . ' fields must be set'
-            );
-        }
+			$services = array_map(function ($class) use ($service, $field) {
+				$service[$field] = $class;
+				return $service;
+			}, $matchingClasses);
 
-        foreach($types as $field => $filteredClasses) {
-            if(!isset($service[$field])) {
-                continue;
-            }
+			foreach ($services as $definitions) {
 
-            /* @var $filteredClasses ClassList */
+				if(isset($definitions['implement'])) {
+					$definition = new FactoryDefinition();
+					$definition->setImplement($definitions['implement']);
+				} else if(isset($definitions['class'])) {
+					$definition = new ServiceDefinition();
+					$definition->setFactory($definitions['class']);
+				}
+				if (isset($definitions['inject'])) {
+					$definition->addTag('nette.inject');
+				}
+				if(isset($definitions['tags'])){
+					$tags = [];
+					foreach($definitions['tags'] as $tag) {
+						$definition->addTag($tag);
+					}
 
-            return [
-                $field,
-                $filteredClasses->getMatching($service[$field]),
-            ];
-        }
+				}
 
-        throw new \RuntimeException('This should never happen');
-    }
+				$builder->addDefinition(null, $definition);
+			}
+		}
+	}
 
-    /**
-     * @param string[] $exludedPatterns
-     * @return ClassList
-     */
-    private function removeExcludedClasses(ClassList $classes, array $exludedPatterns)
-    {
-        return array_reduce($exludedPatterns, function(ClassList $c, $pattern) {
-            return $c->getWithoutClasses($c->getMatching($pattern));
-        }, $classes);
-    }
+	/**
+	 * @param array $service
+	 * @param ClassList $classes
+	 * @return array [definition field, Class list]
+	 */
+	private function getClasses(array $service, ClassList $classes): array
+	{
+		$types = [
+			'class' => $classes->getClasses(),
+			'implement' => $classes->getInterfaces(),
+		];
+
+		if (count(array_intersect_key($service, $types)) !== 1) {
+			throw new \InvalidArgumentException(
+				'Exactly one of '
+				. implode(', ', array_keys($types))
+				. ' fields must be set'
+			);
+		}
+
+		foreach($types as $field => $filteredClasses) {
+			if(!isset($service[$field])) {
+				continue;
+			}
+
+			/* @var $filteredClasses ClassList */
+
+			return [
+				$field,
+				$filteredClasses->getMatching($service[$field]),
+			];
+		}
+
+		throw new \RuntimeException('This should never happen');
+	}
+
+	/**
+	 * @param string[] $exludedPatterns
+	 */
+	private function removeExcludedClasses(ClassList $classes, array $exludedPatterns): ClassList
+	{
+		return array_reduce($exludedPatterns, function(ClassList $c, $pattern) {
+			return $c->getWithoutClasses($c->getMatching($pattern));
+		}, $classes);
+	}
 
 }
